@@ -1,0 +1,4 @@
+# Ignore load-test folder
+load-test
+.vscode
+       
