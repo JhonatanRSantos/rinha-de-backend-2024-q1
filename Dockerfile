@@ -17,7 +17,8 @@ WORKDIR /
 COPY --from=builder /app/app .
 # sets the app as executable
 RUN chmod +x app
-# exposes the port 9999
-EXPOSE 9999
+# exposes the port
+EXPOSE 9910
+EXPOSE 9920
 # runs the app
 CMD ["/app"]

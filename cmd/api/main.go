@@ -169,7 +169,7 @@ func PostTransactions(c *fiber.Ctx) error {
 		balance = client.Balance - request.Amount
 	}
 
-	// Desging decision: I'm not using transactions to make it simple and fast!!!
+	// Desging decision: I'm not using transactions to make it simple and avoid deadlocks
 	if _, err = dbWrite.ExecContext(c.Context(), "UPDATE clients SET balance = ? WHERE id = ?", balance, clientID); err != nil {
 		return c.SendStatus(http.StatusUnprocessableEntity)
 	}
