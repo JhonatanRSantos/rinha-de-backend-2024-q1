@@ -17,8 +17,7 @@ CREATE TABLE IF NOT EXISTS transactions (
 	CONSTRAINT transaction_client_id_fk FOREIGN KEY (`client_id`) REFERENCES clients(`id`)
 ) ENGINE=InnoDB;
 
-INSERT INTO clients 
-	(`id`, `limit`)
+INSERT INTO clients(`id`, `limit`)
 VALUES 
 	(1, 100000),
 	(2, 80000),

@@ -6,8 +6,6 @@ import (
 	"fmt"
 	"net/http"
 	"os"
-	"strconv"
-	"sync"
 	"time"
 
 	"github.com/JhonatanRSantos/gocore/pkg/gocontext"
@@ -34,29 +32,20 @@ var (
 		DatabaseType:   godb.MySQLDB,
 		ConnectTimeout: time.Second * 1,
 	}
-	API_PORT  = os.Getenv("API_PORT")
-	LOCK_PORT = os.Getenv("LOCK_PORT")
-	LOCK_HOST = os.Getenv("LOCK_HOST")
+	API_PORT = os.Getenv("API_PORT")
 )
 
 func main() {
 	golog.SetEnv(goenv.Local)
 
-	if os.Getenv("SERVER_TYPE") == "api" {
-		runAPIServer()
-	}
-	runLockServer()
-}
-
-func runAPIServer() {
 	if dbWrite, err = godb.NewDB(dbConfigs); err != nil {
 		golog.Log().Error(ctx, fmt.Sprintf("failed to connect to the database (write). Cause: %s", err))
 		return
 	}
 	defer dbWrite.Close()
 
-	dbWrite.SetMaxOpenConns(45) // 50 60
-	dbWrite.SetMaxIdleConns(10) // 5
+	dbWrite.SetMaxOpenConns(45)
+	dbWrite.SetMaxIdleConns(10)
 	dbWrite.SetConnMaxLifetime(time.Minute * 1)
 	dbWrite.SetConnMaxIdleTime(time.Minute * 1)
 
@@ -66,13 +55,13 @@ func runAPIServer() {
 	}
 	defer dbRead.Close()
 
-	dbRead.SetMaxOpenConns(15) // 50 60
-	dbRead.SetMaxIdleConns(10) // 5
+	dbRead.SetMaxOpenConns(15)
+	dbRead.SetMaxIdleConns(10)
 	dbRead.SetConnMaxLifetime(time.Minute * 1)
 	dbRead.SetConnMaxIdleTime(time.Minute * 1)
 
 	ws := goweb.NewWebServer(goweb.DefaultConfig(goweb.WebServerDefaultConfig{
-		AppName: "rinha-de-backend-api-server",
+		AppName: "rinha-de-backend-mysql",
 	}))
 
 	routes = append(routes, goweb.WebRoute{
@@ -128,7 +117,7 @@ type PostTransactionResponse struct {
 }
 
 // PostTransactions creates a new transaction for a client
-func PostTransactions(ctx *fiber.Ctx) error {
+func PostTransactions(c *fiber.Ctx) error {
 	var (
 		// tx       godb.Tx
 		err      error
@@ -139,43 +128,28 @@ func PostTransactions(ctx *fiber.Ctx) error {
 		request  PostTransactionRequest
 	)
 
-	body = ctx.Body()
-	clientID = ctx.Params("id")
+	body = c.Body()
+	clientID = c.Params("id")
 
-	// Just to make sure the body is not empty
 	if len(body) == 0 {
-		return ctx.SendStatus(http.StatusUnprocessableEntity)
+		return c.SendStatus(http.StatusUnprocessableEntity)
 	}
 
-	// Unmarshal the body into the transaction struct
 	if err := json.Unmarshal(body, &request); err != nil {
-		return ctx.SendStatus(http.StatusUnprocessableEntity)
+		return c.SendStatus(http.StatusUnprocessableEntity)
 	}
 
-	// Validations
 	if request.Type != "c" && request.Type != "d" {
-		return ctx.SendStatus(http.StatusUnprocessableEntity)
+		return c.SendStatus(http.StatusUnprocessableEntity)
 	}
 
 	descriptionLen := len(request.Description)
 	if descriptionLen < 1 || descriptionLen > 10 {
-		return ctx.SendStatus(http.StatusUnprocessableEntity)
+		return c.SendStatus(http.StatusUnprocessableEntity)
 	}
 
-	// // aquire lock
-	// if _, err := http.Get(fmt.Sprintf("http://%s:%s/lock/%s", LOCK_HOST, LOCK_PORT, clientID)); err != nil {
-	// 	return ctx.SendStatus(http.StatusUnprocessableEntity)
-	// }
-	// // defer release lock
-	// defer func() {
-	// 	if req, err := http.NewRequest("DELETE", fmt.Sprintf("http://%s:%s/lock/%s", LOCK_HOST, LOCK_PORT, clientID), nil); err == nil {
-	// 		http.DefaultClient.Do(req)
-	// 	}
-	// }()
-
-	// Get the client
-	if err = dbWrite.GetContext(ctx.Context(), &client, "SELECT * FROM clients WHERE id = ?", clientID); err != nil {
-		return ctx.SendStatus(http.StatusNotFound)
+	if err = dbWrite.GetContext(c.Context(), &client, "SELECT * FROM clients WHERE id = ?", clientID); err != nil {
+		return c.SendStatus(http.StatusNotFound)
 	}
 
 	switch request.Type {
@@ -185,60 +159,49 @@ func PostTransactions(ctx *fiber.Ctx) error {
 		availableBalance := client.Limit + client.Balance
 
 		if availableBalance == 0 {
-			return ctx.SendStatus(http.StatusUnprocessableEntity)
+			return c.SendStatus(http.StatusUnprocessableEntity)
 		}
 
 		if availableBalance-request.Amount < 0 {
-			return ctx.SendStatus(http.StatusUnprocessableEntity)
+			return c.SendStatus(http.StatusUnprocessableEntity)
 		}
 
 		balance = client.Balance - request.Amount
 	}
 
-	// if tx, err = dbWrite.Begin(); err != nil {
-	// 	return ctx.SendStatus(http.StatusUnprocessableEntity)
-	// }
-
-	if _, err = dbWrite.ExecContext(ctx.Context(), "UPDATE clients SET balance = ? WHERE id = ?", balance, clientID); err != nil {
-		return ctx.SendStatus(http.StatusUnprocessableEntity)
+	// Desging decision: I'm not using transactions to make it simple and fast!!!
+	if _, err = dbWrite.ExecContext(c.Context(), "UPDATE clients SET balance = ? WHERE id = ?", balance, clientID); err != nil {
+		return c.SendStatus(http.StatusUnprocessableEntity)
 	}
 
 	if _, err = dbWrite.ExecContext(
-		ctx.Context(),
+		c.Context(),
 		"INSERT INTO transactions (client_id, amount, type, description, date) VALUES (?, ?, ?, ?, ?)",
-		clientID, request.Amount, request.Type, request.Description, time.Now().UTC().Format(time.RFC3339Nano),
+		clientID,
+		request.Amount,
+		request.Type,
+		request.Description,
+		time.Now().UTC().Format(time.RFC3339Nano),
 	); err != nil {
-		return ctx.SendStatus(http.StatusUnprocessableEntity)
+		return c.SendStatus(http.StatusUnprocessableEntity)
 	}
 
-	// tx.Commit()
-	return ctx.JSON(PostTransactionResponse{
+	return c.JSON(PostTransactionResponse{
 		Limit:   client.Limit,
 		Balance: balance,
 	})
 }
 
 // GetStatement returns the statement of a client
-func GetStatement(ctx *fiber.Ctx) error {
+func GetStatement(c *fiber.Ctx) error {
 	var (
 		client   Client
 		response GetStatementResponse
-		clientID = ctx.Params("id")
+		clientID = c.Params("id")
 	)
 
-	// // aquire lock
-	// if _, err := http.Get(fmt.Sprintf("http://%s:%s/lock/%s", LOCK_HOST, LOCK_PORT, clientID)); err != nil {
-	// 	return ctx.SendStatus(http.StatusUnprocessableEntity)
-	// }
-	// // defer release lock
-	// defer func() {
-	// 	if req, err := http.NewRequest("DELETE", fmt.Sprintf("http://%s:%s/lock/%s", LOCK_HOST, LOCK_PORT, clientID), nil); err == nil {
-	// 		http.DefaultClient.Do(req)
-	// 	}
-	// }()
-
-	if err := dbRead.GetContext(ctx.Context(), &client, "SELECT * FROM clients WHERE id = ?", clientID); err != nil {
-		return ctx.SendStatus(http.StatusNotFound)
+	if err := dbRead.GetContext(c.Context(), &client, "SELECT * FROM clients WHERE id = ?", clientID); err != nil {
+		return c.SendStatus(http.StatusNotFound)
 	}
 
 	response.StatementAmout.Date = time.Now().UTC().Format(time.RFC3339Nano)
@@ -246,103 +209,14 @@ func GetStatement(ctx *fiber.Ctx) error {
 	response.StatementAmout.Total = client.Balance
 	response.Transactions = []Transaction{}
 
-	// if err := dbRead.SelectContext(
-	// 	ctx.Context(),
-	// 	&response.Transactions,
-	// 	"SELECT amount, type, description, date FROM transactions WHERE client_id = ? ORDER BY date DESC LIMIT 10",
-	// 	clientID,
-	// ); err != nil {
-	// 	fmt.Println(err)
-	// 	return ctx.SendStatus(http.StatusNotFound)
-	// }
-
-	return ctx.JSON(response)
-}
-
-var (
-	mutex  sync.RWMutex
-	locker = map[int]time.Time{}
-)
-
-func runLockServer() {
-	ws := goweb.NewWebServer(goweb.DefaultConfig(goweb.WebServerDefaultConfig{
-		AppName: "rinha-de-backend-lock-server",
-	}))
-
-	routes = append(routes, goweb.WebRoute{
-		Method:   "GET",
-		Path:     "/lock/:id",
-		Handlers: []func(c *fiber.Ctx) error{GetLock},
-	}, goweb.WebRoute{
-		Method:   "DELETE",
-		Path:     "/lock/:id",
-		Handlers: []func(c *fiber.Ctx) error{ReleaseLock},
-	})
-
-	ws.AddRoutes(routes...)
-	go func() {
-		ticker := time.NewTicker(3 * time.Second)
-		for range ticker.C {
-			mutex.Lock()
-			for k, v := range locker {
-				if time.Since(v) > time.Second*9 {
-					delete(locker, k)
-				}
-			}
-			mutex.Unlock()
-		}
-	}()
-
-	if err := ws.Listen(fmt.Sprintf(":%s", LOCK_PORT)); err != nil {
-		golog.Log().Error(ctx, fmt.Sprintf("failed to graceful shutdown. Cause: %s", err))
-	}
-}
-
-// GetLock
-func GetLock(ctx *fiber.Ctx) error {
-	var (
-		id             int
-		err            error
-		maxRetries     = 10
-		totalRetriries = 0
-	)
-
-	if id, err = strconv.Atoi(ctx.Params("id")); err != nil {
-		return ctx.Status(http.StatusInternalServerError).SendString(err.Error())
+	if err := dbRead.SelectContext(
+		c.Context(),
+		&response.Transactions,
+		"SELECT amount, type, description, date FROM transactions WHERE client_id = ? ORDER BY date DESC LIMIT 10",
+		clientID,
+	); err != nil {
+		return c.SendStatus(http.StatusNotFound)
 	}
 
-	mutex.RLock()
-	for {
-		if _, ok := locker[id]; !ok {
-			break
-		}
-		totalRetriries++
-		time.Sleep(time.Second)
-		if totalRetriries == maxRetries {
-			mutex.RUnlock()
-			return ctx.SendStatus(http.StatusUnprocessableEntity)
-		}
-	}
-	mutex.RUnlock()
-	mutex.Lock()
-	defer mutex.Unlock()
-	locker[id] = time.Now()
-	return ctx.SendStatus(http.StatusOK)
-}
-
-// ReleaseLock
-func ReleaseLock(ctx *fiber.Ctx) error {
-	var (
-		id  int
-		err error
-	)
-
-	if id, err = strconv.Atoi(ctx.Params("id")); err != nil {
-		return ctx.SendStatus(http.StatusInternalServerError)
-	}
-
-	mutex.Lock()
-	defer mutex.Unlock()
-	delete(locker, id)
-	return ctx.SendStatus(http.StatusOK)
+	return c.JSON(response)
 }
