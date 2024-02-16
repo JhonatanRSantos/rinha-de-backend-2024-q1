@@ -14,54 +14,36 @@ import (
 	"github.com/JhonatanRSantos/gocore/pkg/golog"
 	"github.com/JhonatanRSantos/gocore/pkg/goweb"
 
+	"github.com/bytedance/sonic"
 	"github.com/gofiber/fiber/v2"
 )
 
 var (
-	dbRead    godb.DB
-	dbWrite   godb.DB
-	err       error
-	ctx       = gocontext.FromContext(context.Background())
-	routes    = []goweb.WebRoute{}
-	dbConfigs = godb.DBConfig{
-		Host:           os.Getenv("DB_HOST"),
-		Port:           os.Getenv("DB_PORT"),
-		User:           os.Getenv("DB_USER"),
-		Password:       os.Getenv("DB_PASSWORD"),
-		Database:       os.Getenv("DB_NAME"),
-		DatabaseType:   godb.MySQLDB,
-		ConnectTimeout: time.Second * 1,
-	}
-	API_PORT = os.Getenv("API_PORT")
+	dbRead  godb.DB
+	dbWrite godb.DB
+	ctx     = gocontext.FromContext(context.Background())
 )
 
 func main() {
+	var (
+		err    error
+		routes = []goweb.WebRoute{}
+	)
 	golog.SetEnv(goenv.Local)
 
-	if dbWrite, err = godb.NewDB(dbConfigs); err != nil {
-		golog.Log().Error(ctx, fmt.Sprintf("failed to connect to the database (write). Cause: %s", err))
+	if dbWrite, dbRead, err = GetDatabaseConnections(); err != nil {
+		golog.Log().Error(ctx, err.Error())
 		return
 	}
 	defer dbWrite.Close()
-
-	dbWrite.SetMaxOpenConns(45)
-	dbWrite.SetMaxIdleConns(10)
-	dbWrite.SetConnMaxLifetime(time.Minute * 1)
-	dbWrite.SetConnMaxIdleTime(time.Minute * 1)
-
-	if dbRead, err = godb.NewDB(dbConfigs); err != nil {
-		golog.Log().Error(ctx, fmt.Sprintf("failed to connect to the database (read). Cause: %s", err))
-		return
-	}
 	defer dbRead.Close()
 
-	dbRead.SetMaxOpenConns(15)
-	dbRead.SetMaxIdleConns(10)
-	dbRead.SetConnMaxLifetime(time.Minute * 1)
-	dbRead.SetConnMaxIdleTime(time.Minute * 1)
-
 	ws := goweb.NewWebServer(goweb.DefaultConfig(goweb.WebServerDefaultConfig{
-		AppName: "rinha-de-backend-mysql",
+		AppName: "rinha-de-backend-2024-q1-with-mysql",
+		JSONConfig: goweb.JSONConfig{
+			Encoder: sonic.Marshal,
+			Decoder: sonic.Unmarshal,
+		},
 	}))
 
 	routes = append(routes, goweb.WebRoute{
@@ -76,9 +58,44 @@ func main() {
 
 	ws.AddRoutes(routes...)
 
-	if err := ws.Listen(fmt.Sprintf(":%s", API_PORT)); err != nil {
+	if err := ws.Listen(fmt.Sprintf(":%s", os.Getenv("API_PORT"))); err != nil {
 		golog.Log().Error(ctx, fmt.Sprintf("failed to graceful shutdown. Cause: %s", err))
 	}
+}
+
+// GetDatabaseConnections returns the database connections
+func GetDatabaseConnections() (dbWrite godb.DB, dbRead godb.DB, err error) {
+	dbConfigs := godb.DBConfig{
+		Host:             os.Getenv("DB_HOST"),
+		Port:             os.Getenv("DB_PORT"),
+		User:             os.Getenv("DB_USER"),
+		Password:         os.Getenv("DB_PASSWORD"),
+		Database:         os.Getenv("DB_NAME"),
+		DatabaseType:     godb.MySQLDB,
+		ConnectTimeout:   time.Second * 1,
+		ConnectionParams: godb.MySQLDefaultParams,
+	}
+	dbConfigs.ConnectionParams["parseTime"] = "true"
+
+	if dbWrite, err = godb.NewDB(dbConfigs); err != nil {
+		return nil, nil, fmt.Errorf("failed to connect to the database (write). Cause: %w", err)
+	}
+
+	if dbRead, err = godb.NewDB(dbConfigs); err != nil {
+		return nil, nil, fmt.Errorf("failed to connect to the database (read). Cause: %w", err)
+	}
+
+	dbWrite.SetMaxOpenConns(45)
+	dbWrite.SetMaxIdleConns(10)
+	dbWrite.SetConnMaxLifetime(time.Minute * 1)
+	dbWrite.SetConnMaxIdleTime(time.Minute * 1)
+
+	dbRead.SetMaxOpenConns(15)
+	dbRead.SetMaxIdleConns(10)
+	dbRead.SetConnMaxLifetime(time.Minute * 1)
+	dbRead.SetConnMaxIdleTime(time.Minute * 1)
+
+	return
 }
 
 type Client struct {
@@ -94,10 +111,10 @@ type StatementAmout struct {
 }
 
 type Transaction struct {
-	Amount      int64  `db:"amount"      json:"valor"`
-	Type        string `db:"type"        json:"tipo"`
-	Description string `db:"description" json:"descricao"`
-	Date        string `db:"date"        json:"realizada_em"`
+	Amount      int64     `db:"amount"      json:"valor"`
+	Type        string    `db:"type"        json:"tipo"`
+	Description string    `db:"description" json:"descricao"`
+	CreatedAt   time.Time `db:"created_at"  json:"realizada_em"`
 }
 
 type GetStatementResponse struct {
@@ -119,7 +136,7 @@ type PostTransactionResponse struct {
 // PostTransactions creates a new transaction for a client
 func PostTransactions(c *fiber.Ctx) error {
 	var (
-		// tx       godb.Tx
+		tx       godb.Tx
 		err      error
 		client   Client
 		body     []byte
@@ -148,7 +165,13 @@ func PostTransactions(c *fiber.Ctx) error {
 		return c.SendStatus(http.StatusUnprocessableEntity)
 	}
 
-	if err = dbWrite.GetContext(c.Context(), &client, "SELECT * FROM clients WHERE id = ?", clientID); err != nil {
+	// Desing decision: I'm not using defer to commit or rollback the transaction to avoid wasting time
+	if tx, err = dbWrite.Begin(); err != nil {
+		return c.SendStatus(http.StatusUnprocessableEntity)
+	}
+
+	if err = tx.GetContext(c.Context(), &client, "SELECT * FROM clients WHERE id = ? FOR UPDATE", clientID); err != nil {
+		tx.Rollback()
 		return c.SendStatus(http.StatusNotFound)
 	}
 
@@ -159,33 +182,36 @@ func PostTransactions(c *fiber.Ctx) error {
 		availableBalance := client.Limit + client.Balance
 
 		if availableBalance == 0 {
+			tx.Rollback()
 			return c.SendStatus(http.StatusUnprocessableEntity)
 		}
 
 		if availableBalance-request.Amount < 0 {
+			tx.Rollback()
 			return c.SendStatus(http.StatusUnprocessableEntity)
 		}
 
 		balance = client.Balance - request.Amount
 	}
 
-	// Desging decision: I'm not using transactions to make it simple and avoid deadlocks
-	if _, err = dbWrite.ExecContext(c.Context(), "UPDATE clients SET balance = ? WHERE id = ?", balance, clientID); err != nil {
+	if _, err = tx.ExecContext(c.Context(), "UPDATE clients SET balance = ? WHERE id = ?", balance, clientID); err != nil {
+		tx.Rollback()
 		return c.SendStatus(http.StatusUnprocessableEntity)
 	}
 
-	if _, err = dbWrite.ExecContext(
+	if _, err = tx.ExecContext(
 		c.Context(),
-		"INSERT INTO transactions (client_id, amount, type, description, date) VALUES (?, ?, ?, ?, ?)",
+		"INSERT INTO transactions (client_id, amount, type, description, created_at) VALUES (?, ?, ?, ?, ?)",
 		clientID,
 		request.Amount,
 		request.Type,
 		request.Description,
-		time.Now().UTC().Format(time.RFC3339Nano),
+		time.Now().UTC(),
 	); err != nil {
+		tx.Rollback()
 		return c.SendStatus(http.StatusUnprocessableEntity)
 	}
-
+	tx.Commit()
 	return c.JSON(PostTransactionResponse{
 		Limit:   client.Limit,
 		Balance: balance,
@@ -212,7 +238,7 @@ func GetStatement(c *fiber.Ctx) error {
 	if err := dbRead.SelectContext(
 		c.Context(),
 		&response.Transactions,
-		"SELECT amount, type, description, date FROM transactions WHERE client_id = ? ORDER BY date DESC LIMIT 10",
+		"SELECT amount, type, description, created_at FROM transactions WHERE client_id = ? ORDER BY created_at DESC LIMIT 10",
 		clientID,
 	); err != nil {
 		return c.SendStatus(http.StatusNotFound)
