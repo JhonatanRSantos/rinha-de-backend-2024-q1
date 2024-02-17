@@ -31,15 +31,27 @@ func main() {
 	)
 	golog.SetEnv(goenv.Local)
 
-	if dbWrite, dbRead, err = GetDatabaseConnections(); err != nil {
-		golog.Log().Error(ctx, err.Error())
+	connected := false
+	for attemp := 0; attemp < 100; attemp++ {
+		if dbWrite, dbRead, err = GetDatabaseConnections(); err != nil {
+			golog.Log().Debug(ctx, fmt.Sprintf("failed to connect to the database. Attemp [%d]. Cause: %s", attemp, err))
+			time.Sleep(time.Millisecond * 100)
+			continue
+		}
+		connected = true
+		break
+	}
+
+	if !connected {
+		golog.Log().Error(ctx, "failed to connect to the database. Cause: max attemps reached")
 		return
 	}
+
 	defer dbWrite.Close()
 	defer dbRead.Close()
 
 	ws := goweb.NewWebServer(goweb.DefaultConfig(goweb.WebServerDefaultConfig{
-		AppName: "rinha-de-backend-2024-q1-with-mysql",
+		AppName: "rinha-de-backend-2024-q1-with-mariadb",
 		JSONConfig: goweb.JSONConfig{
 			Encoder: sonic.Marshal,
 			Decoder: sonic.Unmarshal,
@@ -221,12 +233,20 @@ func PostTransactions(c *fiber.Ctx) error {
 // GetStatement returns the statement of a client
 func GetStatement(c *fiber.Ctx) error {
 	var (
+		tx       godb.Tx
+		err      error
 		client   Client
 		response GetStatementResponse
 		clientID = c.Params("id")
 	)
 
-	if err := dbRead.GetContext(c.Context(), &client, "SELECT * FROM clients WHERE id = ?", clientID); err != nil {
+	// Desing decision: I'm not using defer to commit or rollback the transaction to avoid wasting time
+	if tx, err = dbRead.Begin(); err != nil {
+		return c.SendStatus(http.StatusNotFound)
+	}
+
+	if err = tx.GetContext(c.Context(), &client, "SELECT * FROM clients WHERE id = ? FOR UPDATE", clientID); err != nil {
+		tx.Rollback()
 		return c.SendStatus(http.StatusNotFound)
 	}
 
@@ -235,14 +255,15 @@ func GetStatement(c *fiber.Ctx) error {
 	response.StatementAmout.Total = client.Balance
 	response.Transactions = []Transaction{}
 
-	if err := dbRead.SelectContext(
+	if err = tx.SelectContext(
 		c.Context(),
 		&response.Transactions,
 		"SELECT amount, type, description, created_at FROM transactions WHERE client_id = ? ORDER BY created_at DESC LIMIT 10",
 		clientID,
 	); err != nil {
+		tx.Rollback()
 		return c.SendStatus(http.StatusNotFound)
 	}
-
+	tx.Rollback()
 	return c.JSON(response)
 }
