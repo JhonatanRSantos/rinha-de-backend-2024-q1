@@ -19,15 +19,17 @@ import (
 )
 
 var (
-	dbRead  godb.DB
-	dbWrite godb.DB
-	ctx     = gocontext.FromContext(context.Background())
+	dbRead     godb.DB
+	dbWrite    godb.DB
+	ctx        = gocontext.FromContext(context.Background())
+	allClients = map[string]bool{}
 )
 
 func main() {
 	var (
-		err    error
-		routes = []goweb.WebRoute{}
+		err     error
+		routes  = []goweb.WebRoute{}
+		clients = []int64{}
 	)
 	golog.SetEnv(goenv.Local)
 
@@ -50,6 +52,14 @@ func main() {
 	defer dbWrite.Close()
 	defer dbRead.Close()
 
+	// cache all clients
+	if e := dbWrite.SelectContext(ctx, &clients, "SELECT id FROM clients"); e == nil && len(clients) > 0 {
+		for _, client := range clients {
+			allClients[fmt.Sprint(client)] = true
+		}
+	}
+	clients = nil
+
 	ws := goweb.NewWebServer(goweb.DefaultConfig(goweb.WebServerDefaultConfig{
 		AppName: "rinha-de-backend-2024-q1-with-mariadb",
 		JSONConfig: goweb.JSONConfig{
@@ -69,6 +79,7 @@ func main() {
 	})
 
 	ws.AddRoutes(routes...)
+	golog.Log().Info(ctx, "starting the server...")
 
 	if err := ws.Listen(fmt.Sprintf(":%s", os.Getenv("API_PORT"))); err != nil {
 		golog.Log().Error(ctx, fmt.Sprintf("failed to graceful shutdown. Cause: %s", err))
@@ -97,12 +108,12 @@ func GetDatabaseConnections() (dbWrite godb.DB, dbRead godb.DB, err error) {
 		return nil, nil, fmt.Errorf("failed to connect to the database (read). Cause: %w", err)
 	}
 
-	dbWrite.SetMaxOpenConns(45)
+	dbWrite.SetMaxOpenConns(20)
 	dbWrite.SetMaxIdleConns(10)
 	dbWrite.SetConnMaxLifetime(time.Minute * 1)
 	dbWrite.SetConnMaxIdleTime(time.Minute * 1)
 
-	dbRead.SetMaxOpenConns(15)
+	dbRead.SetMaxOpenConns(20)
 	dbRead.SetMaxIdleConns(10)
 	dbRead.SetConnMaxLifetime(time.Minute * 1)
 	dbRead.SetConnMaxIdleTime(time.Minute * 1)
@@ -153,12 +164,14 @@ func PostTransactions(c *fiber.Ctx) error {
 		client   Client
 		body     []byte
 		balance  int64
-		clientID string
 		request  PostTransactionRequest
+		clientID = c.Params("id")
 	)
 
+	if _, ok := allClients[clientID]; !ok {
+		return c.SendStatus(http.StatusNotFound)
+	}
 	body = c.Body()
-	clientID = c.Params("id")
 
 	if len(body) == 0 {
 		return c.SendStatus(http.StatusUnprocessableEntity)
@@ -177,7 +190,6 @@ func PostTransactions(c *fiber.Ctx) error {
 		return c.SendStatus(http.StatusUnprocessableEntity)
 	}
 
-	// Desing decision: I'm not using defer to commit or rollback the transaction to avoid wasting time
 	if tx, err = dbWrite.Begin(); err != nil {
 		return c.SendStatus(http.StatusUnprocessableEntity)
 	}
@@ -240,7 +252,10 @@ func GetStatement(c *fiber.Ctx) error {
 		clientID = c.Params("id")
 	)
 
-	// Desing decision: I'm not using defer to commit or rollback the transaction to avoid wasting time
+	if _, ok := allClients[clientID]; !ok {
+		return c.SendStatus(http.StatusNotFound)
+	}
+
 	if tx, err = dbRead.Begin(); err != nil {
 		return c.SendStatus(http.StatusNotFound)
 	}
